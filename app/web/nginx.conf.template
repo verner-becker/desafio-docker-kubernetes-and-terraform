@@ -1,0 +1,25 @@
+# Config do nginx do front.
+# ${API_UPSTREAM} é injetado por envsubst (a imagem oficial do nginx processa
+# arquivos em /etc/nginx/templates/*.template automaticamente no boot).
+#   - docker-compose: API_UPSTREAM=api:8080
+#   - Kubernetes:     API_UPSTREAM=<service-da-api>:80  (você define no chart)
+server {
+    listen 8080;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Arquivos estáticos do front.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Tudo sob /api/ é repassado para a API. O front nunca precisa saber a URL
+    # absoluta da API — só o nginx sabe, via ${API_UPSTREAM}.
+    location /api/ {
+        proxy_pass http://${API_UPSTREAM};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}

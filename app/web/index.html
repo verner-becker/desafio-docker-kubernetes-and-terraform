@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mural de Recados — Desafio Full Cycle</title>
+  <link rel="preconnect" href="https://esm.sh" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- O React monta a UI aqui. Sem build step: app.js é um ES module que
+       importa React + htm direto da CDN (esm.sh). Continuam sendo só
+       arquivos estáticos servidos pelo nginx — nada muda no Dockerfile/Helm. -->
+  <div id="root"></div>
+  <noscript>Este mural precisa de JavaScript habilitado.</noscript>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

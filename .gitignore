@@ -1,0 +1,16 @@
+# Go
+/app/api/api
+*.test
+
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+solucao/terraform/.kube/
+
+# Node / misc
+node_modules/
+.DS_Store
+
+/solucao
