@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "mural.fullname" . }}
+  labels:
+    {{- include "mural.labels" . | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          # Prefix não corta o prefixo: /api/messages chega intacto na API,
+          # que já espera exatamente esse caminho.
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "mural.fullname" . }}-api
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "mural.fullname" . }}-web
+                port:
+                  number: 80

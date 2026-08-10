@@ -8,6 +8,8 @@
 *.tfstate.*
 .terraform.lock.hcl
 solucao/terraform/.kube/
+infra/terraform/*-config
+crash.log
 
 # Node / misc
 node_modules/

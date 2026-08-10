@@ -1,0 +1,61 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "mural.fullname" . }}-migrate
+  labels:
+    {{- include "mural.labels" . | nindent 4 }}
+  annotations:
+    # Hook do Helm: post-install/post-upgrade (não pre-*) de propósito — um
+    # hook pre-install roda ANTES de qualquer manifesto normal, incluindo o
+    # StatefulSet do Postgres criado por este mesmo chart, então não haveria
+    # banco pra esperar. Com post-install, Postgres e API sobem juntos como
+    # recursos normais e este Job roda logo em seguida, aguardando o Postgres
+    # aceitar conexão. Enquanto isso a API já está no ar mas /readyz falha
+    # (não toca no banco até a migration rodar) — é exatamente a fricção que
+    # a readinessProbe existe para segurar. Reexecuta em toda release; as
+    # migrations são idempotentes de propósito.
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 120
+  template:
+    metadata:
+      labels:
+        {{- include "mural.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: {{ .Values.postgres.image }}
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mural.fullname" . }}-db-credentials
+                  key: DATABASE_URL
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "aguardando o Postgres aceitar conexões..."
+              until psql "$DATABASE_URL" -c 'select 1' > /dev/null 2>&1; do
+                sleep 2
+              done
+              for f in $(ls /migrations/*.sql | sort); do
+                echo "aplicando $f"
+                psql "$DATABASE_URL" -f "$f"
+              done
+          volumeMounts:
+            - name: migrations
+              mountPath: /migrations
+              readOnly: true
+          resources:
+            {{- toYaml .Values.migration.resources | nindent 12 }}
+      volumes:
+        - name: migrations
+          configMap:
+            name: {{ include "mural.fullname" . }}-migrations

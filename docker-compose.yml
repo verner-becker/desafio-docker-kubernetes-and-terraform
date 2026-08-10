@@ -1,0 +1,65 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mural
+      POSTGRES_PASSWORD: mural
+      POSTGRES_DB: mural
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mural -d mural"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    image: postgres:16-alpine
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://mural:mural@db:5432/mural?sslmode=disable
+    volumes:
+      - ./app/api/migrations:/migrations:ro
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        for f in $$(ls /migrations/*.sql | sort); do
+          echo "applying $$f"
+          psql "$$DATABASE_URL" -f "$$f"
+        done
+    restart: "no"
+
+  api:
+    image: golang:1.23-alpine
+    working_dir: /app
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://mural:mural@db:5432/mural?sslmode=disable
+      PORT: "8080"
+    volumes:
+      - ./app/api:/app
+    command: ["sh", "-c", "go mod download && go run ."]
+
+  web:
+    image: nginx:1.27-alpine
+    depends_on:
+      - api
+    environment:
+      API_UPSTREAM: api:8080
+    volumes:
+      - ./app/web/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./app/web/index.html:/usr/share/nginx/html/index.html:ro
+      - ./app/web/app.js:/usr/share/nginx/html/app.js:ro
+      - ./app/web/styles.css:/usr/share/nginx/html/styles.css:ro
+    ports:
+      - "8080:8080"
+
+volumes:
+  db-data:

@@ -1,337 +1,191 @@
-# Do compose ao cluster: Docker, Kubernetes e Terraform
+# Mural de Recados — Docker + Kubernetes + Terraform
 
-## Descrição
+Solução do desafio "Do compose ao cluster". O enunciado original está em
+[`docs/enunciado-original.md`](docs/enunciado-original.md); este README
+documenta as decisões tomadas e como rodar.
 
-Neste desafio você vai pegar uma aplicação **que já funciona** e levá-la de um
-`docker-compose` de desenvolvimento até um **cluster Kubernetes local, provisionado e
-implantado inteiramente por Terraform**, do jeito que se faz no dia a dia.
+## Como rodar
 
-O código da aplicação está pronto e você quase não encosta nele. O desafio é a **infra**:
-containerizar direito, orquestrar no cluster e amarrar tudo num provisionamento
-idempotente. No fim, um único `terraform apply` deve sair do nada até a aplicação
-respondendo no navegador; um segundo `apply` não pode mudar coisa alguma; e um
-`terraform destroy` limpa o rastro.
+Pré-requisitos: Docker, `kind`, `kubectl`, `helm`, `terraform` (>= 1.6).
 
-## Cenário
-
-Um pequeno time construiu o **Mural de Recados**: um front simples, uma API em Go e um
-Postgres. Hoje ele roda no laptop de quem desenvolveu, via `docker compose up`, e "funciona
-na minha máquina". Ninguém sabe subir aquilo em outro lugar sem pedir ajuda: a migração tem
-que rodar na ordem certa, a senha do banco está num arquivo qualquer, e não existe nada que
-reproduza o ambiente de forma confiável.
-
-A decisão foi tomada: o Mural vai para Kubernetes, e o provisionamento tem que ser
-**reproduzível e versionado**. Nada de `kubectl apply` manual, nada de "rodei uns comandos
-e deu certo". Você é a pessoa de infra que vai fazer essa ponte. Recebe a aplicação como
-está, o desenho do estado-alvo e os critérios de aceite. O resto (os Dockerfiles, o chart
-e o Terraform que rege tudo) é o que você entrega.
-
-## Sobre o foco do desafio
-
-O foco é **infra, não a aplicação**. O código do Mural (`app/`) vem pronto e funcional, e
-serve de contexto: você o lê para entender portas, variáveis, dependências e os pontos em que
-o sistema é "chato" de propósito. Você **não deve reescrever a aplicação** para contornar as
-dificuldades. Elas são o desafio. Resolver uma fricção mexendo no Go em vez de resolvê-la no
-Kubernetes é fugir do que se está avaliando.
-
-Algumas situações no starter travam de propósito (a migração que precisa rodar antes, a probe
-que derruba o pod se apontada para o lugar errado, o segredo que não pode ir hardcoded). Cada
-uma tem uma pista no enunciado: a intenção é você **descobrir** a solução, não sofrer no
-escuro.
-
-## Estrutura do desafio
-
-O desafio tem um núcleo obrigatório e um bônus opcional:
-
-- **Obrigatório**: containerizar a app (Docker), empacotar os manifests num **Helm chart** e
-  escrever o **Terraform maestro** que provisiona o cluster e implanta o chart de forma
-  idempotente. É o que os critérios de aceite cobram e o que precisa rodar de ponta a ponta.
-- **Bônus**: autoscaling (HPA) com prova de escala sob carga, e automação do fluxo
-  (Makefile/script). Conta pontos extras, não é pré-requisito.
-
-Feche o obrigatório antes de partir para o bônus.
-
-## Objetivo
-
-Entregar, num fork público deste repositório, os Dockerfiles em `app/docker/` e todo o resto
-dentro de `infra/`, de modo que a partir de um ambiente limpo:
-
-- `terraform apply` **do zero** cria o cluster, disponibiliza as imagens, sobe o Ingress e
-  implanta a aplicação, e o Mural responde no navegador;
-- `terraform apply` rodado **duas vezes seguidas** não recria recursos à toa (idempotência:
-  `0 changed`);
-- `terraform destroy` remove o cluster e tudo que foi criado;
-- a credencial do banco vive num **Secret** (nunca hardcoded em manifest versionado);
-- a imagem da API é **mínima**, com o tamanho antes/depois documentado.
-
-O estado que você deve alcançar está desenhado em
-[`docs/arquitetura.md`](docs/arquitetura.md).
-
-## Contexto
-
-### A aplicação existente
-
-O repositório traz um **Mural de Recados** funcional:
-
-- **API em Go** (`app/api/main.go`): configura-se 100% por variáveis de ambiente
-  (`DATABASE_URL`, `PORT`) e expõe três rotas:
-  - `GET /healthz` (**liveness**): só diz que o processo está de pé; **não toca no banco**.
-  - `GET /readyz` (**readiness**): só passa quando o banco responde **e** a tabela `messages`
-    existe (ou seja, a migração já rodou).
-  - `GET/POST /api/messages`: lista e cria recados, persistindo no Postgres.
-- **Migrations** (`app/api/migrations/`): a API **não cria a tabela sozinha**; o schema vem
-  de `001_init.sql` e `002_seed.sql` (dados iniciais). Ambas precisam rodar antes de a API
-  ficar pronta.
-- **Front estático** (`app/web/`): HTML/CSS/JS servido por nginx. Ele fala com a API por
-  caminho relativo (`/api/...`) e **não conhece a URL absoluta** dela: quem roteia é o nginx,
-  cujo upstream vem de variável de ambiente (`API_UPSTREAM`). O mesmo front funciona no compose
-  e no cluster sem recompilar.
-- **Postgres**: o banco, com a senha embutida na `DATABASE_URL`.
-
-**Este repositório não traz um `docker-compose.yml` pronto. Montá-lo faz parte de conhecer o
-sistema.** Escreva o seu para rodar a app localmente e **entendê-la** (isto é só para entender,
-**não é a entrega**: a entrega é Docker + Helm + Terraform). Use **imagens oficiais** de
-propósito (`go run`, `nginx`, `postgres`). Não é aqui que você escreve seus Dockerfiles.
-
-O compose deve ter **quatro serviços**, subindo nesta ordem: **banco → migração → API → front**.
-
-| Serviço | Imagem | O que precisa conter |
-|---------|--------|----------------------|
-| `db` | `postgres:16-alpine` | Sobe o Postgres com usuário, senha e nome de banco definidos por você. Precisa persistir os dados e sinalizar quando está realmente pronto, para que os outros serviços saibam esperar. |
-| `migrate` | `postgres:16-alpine` | Aplica **todas** as migrations de `./app/api/migrations`, **na ordem**, e então encerra. Não é um serviço que fica no ar, e só deve rodar depois que o banco está pronto. |
-| `api` | `golang:1.23-alpine` | Executa a API a partir do código-fonte em `./app/api` (sem Dockerfile aqui). Toda a configuração vem por variáveis de ambiente: a `DATABASE_URL` (que carrega a senha) e a `PORT`. Só pode subir depois do banco pronto **e** da migração concluída. |
-| `web` | `nginx:1.27-alpine` | Serve o front estático de `./app/web` e faz proxy de `/api` para a API, com o endereço da API vindo de variável de ambiente. Publica a porta pela qual você abre o Mural no navegador. |
-
-Com o seu compose pronto:
+### 1. docker-compose (só para entender a app)
 
 ```bash
 docker compose up --build
 # abra http://localhost:8080
 ```
 
-Repare em três coisas que essa montagem te mostra e que você vai reproduzir no Kubernetes:
+### 2. Ciclo completo via Terraform
 
-- a **migração roda num serviço separado**, antes da API (no K8s isso vira um `Job`);
-- a API só conhece o banco pela env **`DATABASE_URL`**, que carrega a senha;
-- o front **faz proxy de `/api`** para a API: ele não sabe o endereço absoluto dela.
+```bash
+cd infra/terraform
+terraform init
+terraform apply     # cluster kind do zero -> app respondendo
+# abra http://mural.localtest.me
 
-Montar esse compose com imagens oficiais existe para você **entender a app**. Ele **não te dá
-de graça** os Dockerfiles, o chart ou o Terraform, que são a entrega de verdade.
-
-### A arquitetura-alvo
-
-O estado a atingir está em [`docs/arquitetura.md`](docs/arquitetura.md): um cluster **kind**
-onde o Ingress roteia `/` para o front e `/api` para a API, a API conversa com um Postgres em
-**StatefulSet + PVC**, um **Job de migração** sobe o schema antes de a API ficar pronta, e o
-**Terraform** rege todo o provisionamento. Ele cria o cluster, disponibiliza as imagens, instala
-o Traefik (ingress controller) e aplica o chart.
-
-### As fricções propositais
-
-São situações intencionais. Cada uma tem uma pista; a solução mora no Kubernetes, não numa
-alteração do código da app.
-
-1. **A API não cria a tabela sozinha.** Sem alguém rodar a migração, a API sobe mas **nunca
-   fica `Ready`**. *Pista:* olhe `/readyz` e as migrations em `app/api/migrations/`. Como
-   rodar isso no cluster antes/junto do deploy? (Pense em `Job`; no Helm, um *hook* recria a
-   cada release.)
-2. **Liveness ≠ readiness.** `/healthz` diz "processo vivo"; `/readyz` só passa com banco e
-   schema prontos. *Pista:* apontar a **livenessProbe** para `/readyz` mata o pod antes de a
-   migração terminar, causando **CrashLoop**. Escolha a probe certa para cada endpoint.
-3. **Segredo é Secret.** A `DATABASE_URL` carrega a senha do Postgres. *Pista:* ela não pode
-   aparecer em texto plano num `Deployment`/`ConfigMap`. Materialize num `Secret` e injete via
-   `secretKeyRef`.
-
-## Requisitos
-
-Os Dockerfiles ficam em `app/docker/` e todo o resto é produzido dentro de `infra/`. Nenhum requisito é gratuito: cada um resolve uma dor
-concreta de operar o Mural fora de um laptop. Leia o **porquê** antes de sair construindo, pois
-é ele que diz se você resolveu de verdade ou só cumpriu tabela.
-
-### 1. Docker: imagens da API e do front
-
-**Por quê.** Hoje a app sobe com `go run` dentro de uma imagem `golang` de quase 1 GB, com
-toolchain e código-fonte junto. Num cluster, isso é imagem lenta para puxar, mais superfície
-de ataque e mais coisa para dar errado. Uma API em Go compila para um binário estático. Ela
-não precisa carregar o mundo junto.
-
-**Tarefa.** Produza os Dockerfiles da API (`api.Dockerfile`) e do front (`web.Dockerfile`) em `app/docker/` (o Dockerfile é da aplicação, por isso mora junto dela; o resto da entrega segue em `infra/`):
-
-- A API é um binário Go: use **multi-stage** e termine numa imagem **mínima**
-  (`scratch`/`distroless`). Deixe registrado o tamanho **antes e depois** no README do seu
-  fork. É a prova de que você entendeu o ganho, não só copiou um Dockerfile.
-- O front é estático servido por **nginx**, com o proxy de `/api` parametrizável por env
-  (como no compose), para a mesma imagem servir em qualquer ambiente sem recompilar.
-
-### 2. Helm chart: os manifests empacotados
-
-**Por quê.** Você poderia jogar um monte de YAML solto e rodar `kubectl apply`. Mas aí ninguém
-reinstala de forma limpa, ninguém parametriza por ambiente e cada deploy vira um ritual manual.
-Um **chart** transforma o Mural numa unidade versionada, parametrizável e reinstalável. E cada
-peça de dentro dele existe por um motivo específico:
-
-- o **Postgres** guarda os recados: se ele voltar vazio a cada restart, o produto perdeu os
-  dados. Por isso **`StatefulSet` + PVC**, não Deployment efêmero;
-- a **senha do banco** não pode aparecer num `git blame`, por isso **`Secret`**, nunca
-  hardcoded no manifest;
-- o cluster precisa saber **quando não mandar tráfego** para um pod (subindo, migração
-  rodando), por isso **readiness**; e saber quando um pod travou de vez, por isso
-  **liveness**. Trocar uma pela outra derruba a app;
-- um pod não pode consumir o nó inteiro e derrubar os vizinhos, por isso **requests/limits**;
-- a **migração** tem que rodar antes de a API atender, senão `/readyz` nunca passa.
-
-**Tarefa.** Produza um **Helm chart** em `infra/helm/mural/` (não YAML solto) cobrindo, no mínimo:
-
-- `Deployment` da API e do front;
-- **`StatefulSet` + PVC** para o Postgres;
-- `Service` para cada workload e um `Ingress` (`/` → front, `/api` → API);
-- `ConfigMap` para configuração e **`Secret`** para a credencial do banco;
-- **liveness e readiness** corretas (liveness ≠ readiness) onde fizer sentido;
-- **requests e limits** de CPU e memória em todos os workloads;
-- o mecanismo que roda a **migração** antes de a API ficar `Ready` (`Job`/hook).
-
-Valores relevantes (imagens, tags, host, credencial) devem ser **parametrizáveis** por
-`values.yaml`. É o que separa um chart de um YAML disfarçado.
-
-### 3. Terraform: o maestro idempotente
-
-**Por quê.** Este é o ponto do desafio. Sem IaC, subir o Mural é "rodei uns comandos e deu
-certo": irreproduzível, indocumentado, e quando quem montou sai de férias ninguém sabe recriar
-nem desfazer.
-O Terraform torna o ambiente **inteiro** (cluster, rede, ingress, deploy) versionado e
-reproduzível por qualquer pessoa a partir de um comando. E ele tem que ser **idempotente**:
-rodar de novo sobre um ambiente que já está no ar não pode destruir e recriar o que está
-funcionando (isso, num cluster de verdade, é downtime e perda de dados).
-
-**Tarefa.** Produza o Terraform em `infra/terraform/` (`main.tf`, `variables.tf`, `outputs.tf`,
-`versions.tf`) usando os providers `kind` + `helm` + `kubernetes`. Ele é o **maestro**: um único
-ponto de entrada que orquestra tudo.
-
-- `terraform apply` **do zero** cria o cluster kind, disponibiliza as imagens no cluster
-  (dica: `kind load docker-image`), instala o Traefik e faz o **deploy do chart** no
-  namespace `mural`, e o Mural responde;
-- é **idempotente**: `apply` rodado duas vezes seguidas → **`0 added, 0 changed, 0
-  destroyed`**, nada recriado à toa;
-- `terraform destroy` remove o cluster e tudo que foi criado, sem sobra.
-
-## Critérios de Aceite
-
-A entrega é avaliada contra os critérios abaixo.
-
-### Docker
-
-- ☐ `Dockerfile` da API em **multi-stage** com build estático.
-- ☐ Imagem final da API é **mínima** (`scratch`/`distroless`), com tamanho antes/depois
-  documentado.
-- ☐ `Dockerfile` do front serve o estático por nginx com proxy de `/api`.
-
-### Kubernetes / Helm
-
-- ☐ Tudo empacotado num **Helm chart** com valores parametrizáveis (não YAML solto).
-- ☐ Postgres como **StatefulSet + PVC**.
-- ☐ Credencial do banco em **Secret** (nada hardcoded); `ConfigMap` onde couber.
-- ☐ **liveness/readiness** corretas, sem CrashLoop por apontar liveness para `/readyz`.
-- ☐ **requests/limits** de CPU e memória em todos os workloads.
-- ☐ A migração roda no cluster **antes** de a API ficar `Ready` (`Job`/hook).
-
-### Terraform
-
-- ☐ `terraform apply` num ambiente limpo → cluster + namespace `mural` + deploy do chart, e a
-  app responde no navegador.
-- ☐ **Idempotência**: `apply` 2x → nenhum recurso recriado.
-- ☐ `terraform destroy` remove tudo.
-- ☐ Uso adequado dos providers `kind`/`helm`/`kubernetes` e código organizado.
-
-### Consistência geral
-
-- ☐ Nenhum arquivo de manifest versionado contém credencial em texto plano.
-- ☐ A solução não altera o código da aplicação (`app/`) para contornar as fricções.
-
-## Bônus (opcional)
-
-- ☐ **HPA + teste de carga**: um `HorizontalPodAutoscaler` na API, com prova (`k6`/`hey`) de
-  que ela escala sob carga. (Em cluster local o efeito é mais ilustrativo, vale pela prática.)
-- ☐ **Automação e decisões**: um `Makefile`/script encurtando o fluxo (`make up`/`make down`)
-  e um README curto com as decisões que você tomou.
-
-## Estrutura obrigatória do entregável
-
-```
-.
-├── README.md                     (este enunciado; substitua por um README seu no fork)
-├── docker-compose.yml            <- VOCÊ escreve (só p/ entender a app; 4 serviços, ver Contexto)
-├── app/                          (aplicação pronta: NÃO alterar api/ e web/)
-│   ├── api/                      API em Go + migrations/
-│   ├── web/                      front estático + template do nginx
-│   └── docker/                   <- AQUI você trabalha (Dockerfiles)
-│       ├── api.Dockerfile        multi-stage → imagem mínima (scratch/distroless)
-│       └── web.Dockerfile        nginx + proxy /api parametrizável
-├── docs/                         
-├── infra/                        <- AQUI você trabalha
-│   ├── helm/
-│   │   └── mural/                chart do Mural de Recados
-│   │       ├── Chart.yaml
-│   │       ├── values.yaml       valores parametrizáveis (imagens, tags, host, credencial)
-│   │       ├── files/
-│   │       │   └── migrations/   Já existente
-│   │       └── templates/
-│   │           ├── _helpers.tpl
-│   │           ├── api.yaml      Deployment + Service da API (probes, limits)
-│   │           ├── web.yaml      Deployment + Service do front
-│   │           ├── postgres.yaml StatefulSet + PVC + Service do Postgres
-│   │           ├── ingress.yaml  / → front, /api → API
-│   │           ├── secret.yaml   credencial do banco (DATABASE_URL)
-│   │           ├── migrations-configmap.yaml
-│   │           └── migrate-job.yaml  Job/hook que roda a migração antes da API
-│   └── terraform/
-│       ├── main.tf               maestro: kind + Traefik + helm release
-│       ├── variables.tf
-│       ├── outputs.tf
-│       └── versions.tf           providers kind/helm/kubernetes
-└── ...
+terraform apply     # roda de novo: 0 added, 0 changed, 0 destroyed
+terraform destroy   # remove tudo
 ```
 
-## Como entregar
+`*.localtest.me` resolve para `127.0.0.1` publicamente — não precisa mexer
+em `/etc/hosts`.
 
-1. Faça um **fork** deste repositório.
-2. Resolva o desafio: os Dockerfiles em `app/docker/` e o restante (Helm + Terraform) dentro de `infra/`.
-3. Garanta que o ciclo `apply → apply → destroy` funciona a partir de um ambiente limpo.
-4. Envie o **link do seu fork**. Um `README` curto explicando decisões e como rodar conta
-   pontos.
+### Atalhos (Makefile)
 
-Ferramentas sugeridas: Docker · [kind](https://kind.sigs.k8s.io/) · kubectl · Helm ·
-Terraform. Dica: no kind, para o Ingress funcionar em `localhost`, o nó precisa do label
-`ingress-ready=true` e dos port-mappings 80/443; use um host tipo `*.localtest.me` (resolve
-para 127.0.0.1) e você não precisa mexer em `/etc/hosts`.
+```bash
+make compose-up / compose-down   # docker-compose
+make up / make plan / make down  # ciclo Terraform
+make lint / make validate        # helm lint + terraform validate
+make load-test                   # bônus: gera carga e mostra o HPA escalando
+```
 
-## Ordem de execução sugerida
+## Bônus
 
-1. **Monte um compose e entenda a app.** Escreva seu `docker-compose.yml` (a spec dos quatro
-   serviços está na seção *Contexto → A aplicação existente*), rode `docker compose up --build`,
-   abra o navegador e publique um recado. Observe a ordem de subida (banco → migração → API →
-   front) e de onde vem cada configuração.
-2. **Leia a arquitetura-alvo.** Abra [`docs/arquitetura.md`](docs/arquitetura.md) e tenha
-   claro o estado que precisa alcançar no cluster.
-3. **Docker primeiro.** Escreva os Dockerfiles e valide os builds localmente; meça o tamanho
-   da imagem da API.
-4. **Helm chart.** Comece pelo Postgres (StatefulSet + PVC) e pela migração; depois API e
-   front; por último Ingress, probes, limits e a parametrização por `values`. Valide com
-   `helm install` num kind criado à mão antes de automatizar.
-5. **Terraform maestro.** Amarre cluster + imagens + ingress + chart. Só considere pronto
-   quando o `apply` 2x der `0 changed` e o `destroy` limpar tudo.
-6. **Feche o ciclo num ambiente limpo.** Apague o cluster e rode `apply → apply → destroy` do
-   zero, seguindo só o seu próprio README.
-7. **Bônus.** Com o obrigatório fechado, adicione HPA + carga e/ou a automação.
+### HPA (autoscaling da API)
 
-## Dicas Finais
+`infra/helm/mural/templates/hpa.yaml` — `HorizontalPodAutoscaler` (v2) na
+API, mirando 50% de utilização de CPU sobre o `request` configurado (50m),
+entre 1 e 5 réplicas. Parametrizável via `values.yaml`
+(`autoscaling.enabled/minReplicas/maxReplicas/targetCPUUtilizationPercentage`)
+e ligado por padrão pelo Terraform (`var.autoscaling_enabled`).
 
-- **A idempotência é o coração do Terraform.** Se o segundo `apply` recria recursos, algo está
-  sendo tratado como mutável quando não deveria. Valide o "apply 2x" cedo e sempre.
-- **As fricções são o aprendizado.** Se você se pegar alterando o Go para "facilitar", pare:
-  a solução para cada fricção existe no Kubernetes (Job/hook, probe certa, Secret).
-- **Banco com estado em cluster local confunde.** Preste atenção em `volumeClaimTemplates` e no
-  comportamento do PVC no kind, que é a parte que mais trava.
-- **Documente decisões.** Um README curto explicando por que você fez cada escolha (e o
-  tamanho da imagem antes/depois) diferencia a entrega e conta ponto.
+Duas coisas precisavam existir pra isso funcionar de verdade:
 
----
+- **metrics-server**: kind não vem com ele. Sem uma fonte de métricas de
+  CPU/memória, o HPA fica com `<unknown>` pra sempre. O Terraform instala o
+  chart oficial (`helm_release.metrics_server`) com `--kubelet-insecure-tls`
+  — necessário porque o kubelet do kind não expõe um certificado que o
+  metrics-server valide por padrão (comum em cluster local).
+- **`replicas` condicional no Deployment**: quando `autoscaling.enabled`,
+  o template da API *não* fixa `spec.replicas` — se fixasse, cada
+  `helm upgrade` reverteria o número de réplicas que o HPA tivesse ajustado
+  por conta própria, brigando com o autoscaler.
+
+### Prova de escala sob carga
+
+Com o cluster no ar (`make up`), gerei carga com `k6`
+(`scripts/load-test.js`, 80 VUs por 3 minutos) contra
+`http://mural.localtest.me/api/messages` e acompanhei `kubectl get hpa -n
+mural -w` em paralelo:
+
+```
+HORA      CPU (target 50%)   RÉPLICAS
+20:21:45  2%                 1   <- antes da carga
+20:22:10  326%               1   <- HPA detectou o pico
+20:22:23  326%               4   <- escalou
+20:22:35  336%               5   <- atingiu o máximo (maxReplicas)
+20:22:48–20:24:55  121%–225% 5   <- sustenta o máximo sob carga contínua
+20:25:32  2%                 5   <- carga parou, CPU já caiu...
+20:30:05  2%                 1   <- ...mas só desce depois da janela de
+                                     estabilização padrão do HPA (~5min)
+```
+
+k6 reportou 272.775 requisições em 3 minutos (~1514 req/s), com a maior
+parte das falhas concentrada bem no início, antes do HPA reagir. O
+comportamento nas duas direções (escala pra cima rápido, escala pra baixo
+devagar de propósito, para não oscilar) é o esperado de um HPA padrão.
+
+Para reproduzir: `make load-test` num terminal, `kubectl get hpa -n mural
+-w` em outro.
+
+## Decisões e por quê
+
+### Docker: imagem da API
+
+Multi-stage build (`app/docker/api.Dockerfile`): builder em
+`golang:1.23-alpine` compila um binário estático
+(`CGO_ENABLED=0`, `-ldflags="-s -w"`), a imagem final é `scratch` — sem
+shell, sem package manager, só o binário. Não precisa de CA certs porque a
+conexão com o Postgres dentro do cluster usa `sslmode=disable` (tráfego
+interno). Roda como usuário não-root (`65532:65532`).
+
+**Tamanho medido:**
+
+| Imagem | Tamanho |
+|---|---|
+| `golang:1.23-alpine` (como a app rodava via `go run` no compose) | 246 MB |
+| `mural-api:local` (multi-stage, `scratch`) | **9.38 MB** |
+
+Redução de ~26x. O front (`app/docker/web.Dockerfile`) é só `nginx:1.27-alpine`
+mais os estáticos — já é mínimo por natureza (48.3 MB, igual à imagem base).
+
+### Helm: hook de migração é `post-install,post-upgrade`, não `pre-install`
+
+A primeira tentativa usou `pre-install,pre-upgrade` (a associação mais óbvia
+com "roda antes da API"). Falhou: hooks `pre-install` rodam **antes de
+qualquer manifesto normal do release**, incluindo o `StatefulSet` do
+Postgres — então o Job de migração não tinha banco nenhum pra esperar (a
+migração ficava presa no loop de espera até estourar o timeout).
+
+A correção foi trocar para `post-install,post-upgrade`: Postgres, API e web
+sobem juntos como recursos normais; o Job roda logo em seguida, espera o
+Postgres aceitar conexão e aplica o schema. Nesse intervalo a API já está no
+ar mas `/readyz` responde 503 (não toca no banco até a tabela existir) — é
+exatamente a fricção que a `readinessProbe` existe pra segurar, sem tirar a
+API do ar (a `livenessProbe`, em `/healthz`, nunca falha nesse meio tempo).
+
+### Terraform: `helm_release` do chart usa `wait = false`
+
+Combinar hook `post-install` com `wait = true` no Helm cria um deadlock real
+(reproduzido manualmente durante o desenvolvimento): `--wait` espera os
+recursos normais — incluindo o Deployment da API — ficarem `Ready` **antes**
+de disparar os hooks `post-install`. Mas a API só fica `Ready` **depois** que
+o hook migra o schema. Resultado: o Helm trava esperando algo que nunca vai
+acontecer, porque o próprio `--wait` está impedindo o hook de rodar.
+
+A solução: `helm_release.mural` usa `wait = false` (os hooks continuam
+rodando de forma síncrona — isso o Helm sempre garante, com ou sem
+`--wait`), e um `null_resource.wait_for_app` separado confirma, via `curl`
+retry real através do Ingress, que a app está respondendo antes do
+`terraform apply` ser considerado concluído.
+
+### Terraform: namespace via provider `kubernetes`, não `create_namespace` do Helm
+
+O namespace `mural` é criado por um `kubernetes_namespace` explícito, não
+pela flag `create_namespace` do `helm_release`. Lifecycle e ownership ficam
+claros no state do Terraform (e os três providers pedidos — `kind`, `helm`
+e `kubernetes` — são todos efetivamente usados para provisionar recursos,
+não só declarados).
+
+### Terraform: `node_image` do kind pinado por digest
+
+O provider `tehcyx/kind` embute uma versão da lib `sigs.k8s.io/kind` mais
+nova que o `kind` CLI usado durante o desenvolvimento. Nesse ambiente (WSL2
+rodando cgroups em modo híbrido v1/v2), a versão mais nova resolve a tag
+`v1.31.0` para uma imagem cujo kubelet se recusa a inicializar
+(`kubelet is configured to not run on a host using cgroup v1`), enquanto o
+`kind` CLI local resolve a mesma tag para outro digest que funciona
+normalmente. A correção foi fixar `node_image` no `kind_cluster` com o
+digest exato já validado — o que também é, por si só, uma prática melhor de
+IaC (evita "tag drift" entre applies).
+
+### Segredo do banco
+
+`postgres.password` não tem valor literal em nenhum arquivo versionado
+(`values.yaml` traz só `""`). O Terraform gera a senha com
+`random_password` e injeta via `set_sensitive` no `helm_release` — nunca
+escrita em disco em texto plano, nunca aparece em `git diff`. Fica estável
+entre applies (enquanto o state local persistir), o que é o que garante
+"apply 2x = 0 changes" para o Secret.
+
+### Ambiente de desenvolvimento (nota lateral, não faz parte da entrega)
+
+Todo o desenvolvimento/teste local rodou dentro de um container "toolbox"
+descartável (fora deste repositório, em `../toolbox/`) com `kind`,
+`kubectl`, `helm`, `terraform` e o CLI do `docker`, falando com o Docker
+Engine do host via `docker.sock` montado (Docker-out-of-Docker). Isso evitou
+instalar essas ferramentas diretamente na máquina de desenvolvimento. É
+irrelevante para a avaliação: quem roda `terraform apply` a partir deste
+fork só precisa das "Ferramentas sugeridas" normais instaladas.
+
+## Estrutura
+
+```
+app/docker/api.Dockerfile   # multi-stage, scratch
+app/docker/web.Dockerfile   # nginx + proxy /api parametrizável
+infra/helm/mural/           # chart: api, web, postgres (StatefulSet+PVC),
+                             # secret, configmap, migrate-job (hook), ingress, hpa
+infra/terraform/            # maestro: kind + traefik + metrics-server + helm_release do chart
+scripts/load-test.js        # bônus: script k6 pro teste de carga do HPA
+Makefile                    # atalhos (compose, terraform, lint, load-test)
+```
